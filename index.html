@@ -1,0 +1,1052 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Earth Keeper Defense</title>
+    <style>
+      :root {
+        font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        background: #030712;
+        color: #e2e8f0;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: radial-gradient(circle at top, rgba(59, 130, 246, 0.25), transparent 65%);
+      }
+
+      .layout {
+        width: min(1200px, 96vw);
+        padding: 20px;
+        display: grid;
+        grid-template-columns: 2fr 1fr;
+        gap: 20px;
+      }
+
+      canvas {
+        background: #020617;
+        border: 2px solid #38bdf8;
+        border-radius: 18px;
+        box-shadow: 0 25px 60px rgba(15, 23, 42, 0.6);
+      }
+
+      .sidebar {
+        background: rgba(15, 23, 42, 0.85);
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        border-radius: 18px;
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+
+      h2 {
+        margin: 0;
+        font-size: 22px;
+        letter-spacing: 0.04em;
+      }
+
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+        gap: 12px;
+      }
+
+      .stat-card {
+        background: rgba(2, 6, 23, 0.7);
+        border: 1px solid rgba(148, 163, 184, 0.2);
+        border-radius: 14px;
+        padding: 12px;
+      }
+
+      .stat-card span {
+        display: block;
+        font-size: 12px;
+        color: #94a3b8;
+        letter-spacing: 0.08em;
+      }
+
+      .stat-card strong {
+        font-size: 24px;
+        color: #f8fafc;
+      }
+
+      .btn {
+        border: none;
+        border-radius: 14px;
+        padding: 16px;
+        background: linear-gradient(120deg, #facc15, #f97316);
+        color: #041423;
+        font-weight: 700;
+        font-size: 18px;
+        cursor: pointer;
+        transition: transform 0.2s ease;
+      }
+
+      .btn.secondary {
+        background: linear-gradient(120deg, #22d3ee, #3b82f6);
+        color: #041423;
+      }
+
+      .btn:disabled {
+        opacity: 0.35;
+        cursor: not-allowed;
+      }
+
+      .btn:hover:not(:disabled) {
+        transform: translateY(-3px);
+      }
+
+      .instructions {
+        font-size: 14px;
+        line-height: 1.6;
+        color: #cbd5f5;
+      }
+
+      ul {
+        margin: 0;
+        padding-left: 18px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="layout">
+      <canvas id="game" width="780" height="780"></canvas>
+      <aside class="sidebar">
+        <h2>Earth Keeper Defense</h2>
+        <div class="stats">
+          <div class="stat-card">
+            <span>기지 HP</span>
+            <strong id="base-hp">0</strong>
+          </div>
+          <div class="stat-card">
+            <span>골드</span>
+            <strong id="gold">0</strong>
+          </div>
+          <div class="stat-card">
+            <span>남은 시간</span>
+            <strong id="timer">120s</strong>
+          </div>
+          <div class="stat-card">
+            <span>퇴치 수</span>
+            <strong id="kills">0</strong>
+          </div>
+        </div>
+        <button id="buy-tower" class="btn secondary">골드로 새 타워 배치</button>
+        <button id="emergency-power" class="btn secondary">긴급 전력 (7골드)</button>
+        <div class="instructions">
+          <p>
+            노란 전력 구슬이 18개의 외곽 칸을 따라 5초에 한 바퀴 돌며 해당 칸의 능력을 활성화합니다.
+            공격형 슬롯은 구슬이 지날 때 1초 동안만 적을 공격할 수 있습니다.
+          </p>
+          <ul>
+            <li>3분 동안 중앙 기지를 지켜내면 승리합니다.</li>
+            <li>적 처치 시 2골드 획득, 3골드로 랜덤 타워를 새 슬롯에 배치합니다.</li>
+            <li>초기에는 공격 타워 2개와 지원 타워 1개가 자동 배치됩니다.</li>
+            <li>같은 종류·레벨의 타워를 드래그해 합치면 Lv업하며 효과가 강화됩니다.</li>
+            <li>긴급 전력으로 7골드를 소비하면 3바퀴 동안 전력 구슬이 빠르게 회전합니다.</li>
+          </ul>
+        </div>
+        <button id="start-game" class="btn">게임 시작</button>
+      </aside>
+    </div>
+    <script>
+      const canvas = document.getElementById('game');
+      const ctx = canvas.getContext('2d');
+      const ctr = { x: canvas.width / 2, y: canvas.height / 2 };
+
+      // ===== 조절 가능한 스탯 =====
+      const CONFIG_SOURCE = {
+        enabled: false, // 스프레드시트(또는 JSON) URL을 연결하려면 true로 전환
+        url: './config-overrides.json', // 예: 공개된 Google Sheets JSON/CSV → 변환된 엔드포인트
+      };
+
+      const LEVEL_MAX = 5;
+      const LEVEL_SPEED_MULT = 2.5;
+
+      const CONFIG = {
+        base: { maxHp: 400, radius: 80 },
+        orb: { slots: 18, radius: 110, revolutionMs: 5000, activeMs: 1200 },
+        runtime: { durationMs: 180000, towerCost: 3 },
+        emergency: { cost: 7, revolutionMs: 3000, loops: 3 },
+        economy: { goldPerKill: 2 },
+        waves: { bigWaveIntervalMs: 50000, bigWaveCount: 3 },
+        projectiles: { tower: 260, ally: 260, enemy: 260, size: 4 },
+        grid: { tile: 28, healAmount: 8, summonCooldown: 4500 },
+        enemies: {
+          melee: { hp: 18, atk: 4, aps: 2, range: 2, speed: 32, spawn: 4400 },
+          ranger: { hp: 10, atk: 3, aps: 1.6, range: 3, speed: 20, spawn: 6400 },
+        },
+        towers: {
+          offense: [
+            { name: '공01', dmg: 6, aps: 2.4, range: 10 },
+            { name: '공02', dmg: 11, aps: 1.2, range: 8 },
+            { name: '공03', dmg: 3, aps: 6, range: 6 },
+          ],
+          summon: [
+            { name: '유닛01', unit: { hp: 40, dmg: 4, aps: 2, range: 4 } },
+            { name: '유닛02', unit: { hp: 24, dmg: 3, aps: 1.2, range: 6 } },
+          ],
+          heal: { name: '회복', heal: 100 },
+        },
+      };
+
+      async function loadExternalConfig() {
+        if (!CONFIG_SOURCE.enabled || !CONFIG_SOURCE.url) return;
+        try {
+          const res = await fetch(CONFIG_SOURCE.url);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const text = await res.text();
+          let overrides;
+          try {
+            overrides = JSON.parse(text);
+          } catch (err) {
+            console.warn('외부 설정 JSON 파싱 실패', err);
+            return;
+          }
+          mergeDeep(CONFIG, overrides);
+          console.info('[CONFIG] 외부 설정을 불러왔습니다.');
+        } catch (error) {
+          console.warn('[CONFIG] 외부 스프레드시트/JSON을 불러오지 못했습니다.', error);
+        }
+      }
+
+      function mergeDeep(target, source) {
+        if (!source || typeof source !== 'object') return;
+        Object.keys(source).forEach((key) => {
+          const srcValue = source[key];
+          const dstValue = target[key];
+          if (Array.isArray(srcValue)) {
+            target[key] = srcValue.map((item, idx) => {
+              if (typeof item === 'object' && dstValue && typeof dstValue[idx] === 'object') {
+                const clone = { ...dstValue[idx] };
+                mergeDeep(clone, item);
+                return clone;
+              }
+              return item;
+            });
+          } else if (srcValue && typeof srcValue === 'object') {
+            if (!dstValue || typeof dstValue !== 'object') target[key] = {};
+            mergeDeep(target[key], srcValue);
+          } else {
+            target[key] = srcValue;
+          }
+        });
+      }
+      // ============================
+
+      const state = {
+        baseHp: CONFIG.base.maxHp,
+        gold: 0,
+        kills: 0,
+        elapsed: 0,
+        running: false,
+        gameOver: false,
+        result: '',
+        lastTime: performance.now(),
+        orbAngle: 0,
+        slots: [],
+        towers: [],
+        allies: [],
+        enemies: [],
+        projectiles: [],
+        flashes: [],
+        spawnTimers: { melee: 0, ranger: 0 },
+        nextBigWave: CONFIG.waves.bigWaveIntervalMs,
+        enemySpawnCount: 0,
+        dragging: null,
+        orbBoostLoops: 0,
+        orbBoostProgress: 0,
+      };
+
+      const UI = {
+        hp: document.getElementById('base-hp'),
+        gold: document.getElementById('gold'),
+        timer: document.getElementById('timer'),
+        kills: document.getElementById('kills'),
+        buyBtn: document.getElementById('buy-tower'),
+        emergencyBtn: document.getElementById('emergency-power'),
+        startBtn: document.getElementById('start-game'),
+      };
+
+      function resetGame() {
+        state.baseHp = CONFIG.base.maxHp;
+        state.gold = 0;
+        state.kills = 0;
+        state.elapsed = 0;
+        state.gameOver = false;
+        state.result = '';
+        state.orbAngle = 0;
+        state.slots = buildSlots();
+        state.towers = [];
+        state.allies = [];
+        state.enemies = [];
+        state.projectiles = [];
+        state.flashes = [];
+        state.spawnTimers = { melee: 0, ranger: 0 };
+        state.nextBigWave = CONFIG.waves.bigWaveIntervalMs;
+        state.enemySpawnCount = 0;
+        state.dragging = null;
+        state.orbBoostLoops = 0;
+        state.orbBoostProgress = 0;
+        placeInitialTowers();
+        state.lastTime = performance.now();
+        updateHUD();
+      }
+
+      function buildSlots() {
+        const slots = [];
+        for (let i = 0; i < CONFIG.orb.slots; i += 1) {
+          const angle = (Math.PI * 2 * i) / CONFIG.orb.slots - Math.PI / 2;
+          slots.push({ angle, tower: null, lastActivated: 0 });
+        }
+        return slots;
+      }
+
+      function placeInitialTowers() {
+        const pool = [...state.slots];
+        const claim = (def) => {
+          if (!pool.length || !def) return;
+          const slot = pool.splice(Math.floor(Math.random() * pool.length), 1)[0];
+          slot.tower = createTower(def, slot);
+          registerTower(slot.tower);
+        };
+        claim(randomOf(CONFIG.towers.offense));
+        claim(randomOf(CONFIG.towers.offense));
+        claim(randomOf(CONFIG.towers.summon));
+        claim(CONFIG.towers.heal);
+      }
+
+      function randomOf(arr) {
+        return arr[Math.floor(Math.random() * arr.length)];
+      }
+
+      function randomTowerDefByType(type) {
+        if (type === 'offense') return randomOf(CONFIG.towers.offense);
+        if (type === 'summon') return randomOf(CONFIG.towers.summon);
+        if (type === 'heal') return CONFIG.towers.heal;
+        return null;
+      }
+
+      function randomTowerDefAny() {
+        const pool = [
+          ...CONFIG.towers.offense,
+          ...CONFIG.towers.summon,
+          CONFIG.towers.heal,
+        ].filter(Boolean);
+        return randomOf(pool);
+      }
+
+      function canMerge(sourceSlot, targetSlot) {
+        if (!sourceSlot || !targetSlot || sourceSlot === targetSlot) return false;
+        const a = sourceSlot.tower;
+        const b = targetSlot.tower;
+        if (!a || !b) return false;
+        if (a.type !== b.type) return false;
+        if (a.level !== b.level) return false;
+        if (a.level >= LEVEL_MAX) return false;
+        return true;
+      }
+
+      function attemptMerge(sourceSlot, targetSlot) {
+        if (!canMerge(sourceSlot, targetSlot)) return false;
+        const newDef = randomTowerDefAny();
+        const newLevel = Math.min(LEVEL_MAX, targetSlot.tower.level + 1);
+        unregisterTower(sourceSlot.tower);
+        unregisterTower(targetSlot.tower);
+        sourceSlot.tower = null;
+        const upgraded = createTower(newDef, targetSlot, newLevel);
+        targetSlot.tower = upgraded;
+        registerTower(upgraded);
+        return true;
+      }
+
+      function createTower(def, slot, level = 1) {
+        if (!def) return null;
+        if (def.heal) {
+          return {
+            slot,
+            type: 'heal',
+            heal: def.heal,
+            level,
+            baseDef: def,
+          };
+        }
+        if (def.unit) {
+          return {
+            slot,
+            type: 'summon',
+            unit: { ...def.unit },
+            cooldown: 0,
+            level,
+            baseDef: def,
+          };
+        }
+        return {
+          slot,
+          type: 'offense',
+          damage: def.dmg,
+          aps: def.aps,
+          rangePx: def.range * CONFIG.grid.tile,
+          activeUntil: 0,
+          lastAttack: 0,
+          level,
+          baseDef: def,
+        };
+      }
+
+      function registerTower(tower) {
+        if (tower) state.towers.push(tower);
+      }
+
+      function unregisterTower(tower) {
+        const idx = state.towers.indexOf(tower);
+        if (idx >= 0) state.towers.splice(idx, 1);
+      }
+
+      function slotPosition(slot) {
+        return {
+          x: ctr.x + Math.cos(slot.angle) * CONFIG.orb.radius,
+          y: ctr.y + Math.sin(slot.angle) * CONFIG.orb.radius,
+        };
+      }
+
+      function slotHitTest(x, y) {
+        for (let i = 0; i < state.slots.length; i += 1) {
+          const slot = state.slots[i];
+          const pos = slotPosition(slot);
+          if (Math.abs(x - pos.x) <= 24 && Math.abs(y - pos.y) <= 24) return slot;
+        }
+        return null;
+      }
+
+      function canvasPoint(evt) {
+        const rect = canvas.getBoundingClientRect();
+        return {
+          x: ((evt.clientX - rect.left) / rect.width) * canvas.width,
+          y: ((evt.clientY - rect.top) / rect.height) * canvas.height,
+        };
+      }
+
+      function handlePointerDown(evt) {
+        if (!state.running) return;
+        if (typeof evt.button === 'number' && evt.button !== 0) return;
+        const pos = canvasPoint(evt);
+        const slot = slotHitTest(pos.x, pos.y);
+        if (!slot || !slot.tower) return;
+        evt.preventDefault();
+        state.dragging = {
+          slot,
+          tower: slot.tower,
+          pointerId: evt.pointerId,
+          x: pos.x,
+          y: pos.y,
+        };
+        if (canvas.setPointerCapture) {
+          try {
+            canvas.setPointerCapture(evt.pointerId);
+          } catch (_) {}
+        }
+      }
+
+      function handlePointerMove(evt) {
+        if (!state.dragging || state.dragging.pointerId !== evt.pointerId) return;
+        const pos = canvasPoint(evt);
+        state.dragging.x = pos.x;
+        state.dragging.y = pos.y;
+      }
+
+      function handlePointerUp(evt) {
+        if (!state.dragging || state.dragging.pointerId !== evt.pointerId) return;
+        const pos = canvasPoint(evt);
+        const target = slotHitTest(pos.x, pos.y);
+        if (target) attemptMerge(state.dragging.slot, target);
+        state.dragging = null;
+        if (canvas.releasePointerCapture) {
+          try {
+            canvas.releasePointerCapture(evt.pointerId);
+          } catch (_) {}
+        }
+      }
+
+      function activateSlot(slot) {
+        const tower = slot.tower;
+        if (!tower) return;
+        if (tower.type === 'offense') {
+          tower.activeUntil = performance.now() + CONFIG.orb.activeMs;
+          tower.lastAttack = 0;
+        } else if (tower.type === 'summon') {
+          if (tower.cooldown < performance.now()) {
+            spawnAlly(tower);
+            tower.cooldown = performance.now() + CONFIG.grid.summonCooldown;
+          }
+        } else if (tower.type === 'heal') {
+          state.baseHp = Math.min(CONFIG.base.maxHp, state.baseHp + getHealAmount(tower));
+        }
+      }
+
+      function spawnAlly(tower) {
+        const unit = tower.unit;
+        const pos = slotPosition(tower.slot);
+        const stats = getSummonStats(tower);
+        for (let i = 0; i < stats.count; i += 1) {
+          const spread = stats.count > 1 ? 18 : 0;
+          const angleOffset = stats.count > 1 ? (i - (stats.count - 1) / 2) * 0.35 : 0;
+          const offsetX = spread ? Math.cos(tower.slot.angle + angleOffset) * spread : 0;
+          const offsetY = spread ? Math.sin(tower.slot.angle + angleOffset) * spread : 0;
+          state.allies.push({
+            x: pos.x + offsetX,
+            y: pos.y + offsetY,
+            hp: unit.hp,
+            damage: unit.dmg,
+            aps: stats.aps,
+            rangePx: unit.range * CONFIG.grid.tile,
+            speed: CONFIG.enemies.melee.speed,
+            lastAttack: 0,
+            expireAt: performance.now() + 10000,
+          });
+        }
+      }
+
+      function levelMultiplier(level) {
+        if (level <= 1) return 1;
+        return Math.pow(LEVEL_SPEED_MULT, level - 1);
+      }
+
+      function getOffenseStats(tower) {
+        return {
+          rangePx: tower.rangePx,
+          aps: tower.aps * levelMultiplier(tower.level),
+          damage: tower.damage,
+        };
+      }
+
+      function getHealAmount(tower) {
+        return (tower.heal || CONFIG.grid.healAmount) * levelMultiplier(tower.level);
+      }
+
+      function getSummonStats(tower) {
+        return {
+          count: tower.level > 1 ? 2 : 1,
+          aps: tower.unit.aps * levelMultiplier(tower.level),
+        };
+      }
+
+      function spawnEnemy(type) {
+        const def = CONFIG.enemies[type];
+        if (!def) return;
+        state.enemySpawnCount += 1;
+        const timeScale = Math.pow(1.1, Math.floor(state.elapsed / 10000));
+        const hpScale = 1 + state.enemySpawnCount * 0.05;
+        const hp = def.hp * timeScale * hpScale;
+        const angle = Math.random() * Math.PI * 2;
+        const radius = CONFIG.orb.radius + 260;
+        state.enemies.push({
+          type,
+          x: ctr.x + Math.cos(angle) * radius,
+          y: ctr.y + Math.sin(angle) * radius,
+          hp,
+          maxHp: hp,
+          attack: def.atk * timeScale,
+          rangePx: def.range * CONFIG.grid.tile,
+          speed: def.speed,
+          aps: def.aps,
+          lastAttack: 0,
+          focus: null,
+        });
+      }
+
+      function updatePowerOrb(delta) {
+        const rev = state.orbBoostLoops > 0 ? CONFIG.emergency.revolutionMs : CONFIG.orb.revolutionMs;
+        const deltaAngle = ((Math.PI * 2) / rev) * delta;
+        state.orbAngle = (state.orbAngle + deltaAngle) % (Math.PI * 2);
+        if (state.orbBoostLoops > 0) {
+          state.orbBoostProgress += deltaAngle;
+          while (state.orbBoostProgress >= Math.PI * 2) {
+            state.orbBoostProgress -= Math.PI * 2;
+            state.orbBoostLoops -= 1;
+            if (state.orbBoostLoops <= 0) {
+              state.orbBoostLoops = 0;
+              state.orbBoostProgress = 0;
+              break;
+            }
+          }
+        } else {
+          state.orbBoostProgress = 0;
+        }
+        state.slots.forEach((slot) => {
+          const diff = normalizeAngle(state.orbAngle - slot.angle);
+          if (Math.abs(diff) < 0.12 && performance.now() - slot.lastActivated > 450) {
+            activateSlot(slot);
+            slot.lastActivated = performance.now();
+          }
+        });
+      }
+
+      function normalizeAngle(angle) {
+        let a = angle;
+        while (a > Math.PI) a -= Math.PI * 2;
+        while (a < -Math.PI) a += Math.PI * 2;
+        return a;
+      }
+
+      function updateTowers(delta) {
+        const now = performance.now();
+        state.towers.forEach((tower) => {
+          if (tower.type !== 'offense') return;
+          if (now > tower.activeUntil) return;
+          const origin = slotPosition(tower.slot);
+          const stats = getOffenseStats(tower);
+          if (now - tower.lastAttack >= 1000 / stats.aps) {
+            const target = findEnemyFromBase(stats.rangePx);
+            if (target) {
+              fireProjectile(origin, target, stats.damage, '#38bdf8', CONFIG.projectiles.tower, 'tower');
+              tower.lastAttack = now;
+            }
+          }
+        });
+      }
+
+      function updateAllies(delta) {
+        const now = performance.now();
+        for (let i = state.allies.length - 1; i >= 0; i -= 1) {
+          const ally = state.allies[i];
+          if (ally.expireAt && now > ally.expireAt) {
+            state.allies.splice(i, 1);
+            continue;
+          }
+          const chase = findNearestEnemy(ally, Infinity);
+          if (chase) moveTowards(ally, chase, ally.speed, delta);
+          if (now - ally.lastAttack >= 1000 / ally.aps) {
+            const target = findNearestEnemy(ally, ally.rangePx);
+            if (target) {
+              fireProjectile(
+                { x: ally.x, y: ally.y },
+                target,
+                ally.damage,
+                '#4ade80',
+                CONFIG.projectiles.ally,
+                'ally',
+                ally
+              );
+              ally.lastAttack = now;
+            }
+          }
+        }
+      }
+
+      function updateEnemies(delta) {
+        const now = performance.now();
+        state.enemies.forEach((enemy) => {
+          const target = chooseEnemyTarget(enemy);
+          moveTowards(enemy, target === 'base' ? ctr : target, enemy.speed, delta);
+          if (now - enemy.lastAttack >= 1000 / enemy.aps) {
+            if (enemy.rangePx <= CONFIG.grid.tile * 2) {
+              applyDamage(target, enemy.attack);
+            } else {
+              fireProjectile(
+                { x: enemy.x, y: enemy.y },
+                target,
+                enemy.attack,
+                '#fb7185',
+                CONFIG.projectiles.enemy,
+                'enemy'
+              );
+            }
+            enemy.lastAttack = now;
+          }
+        });
+      }
+
+      function chooseEnemyTarget(enemy) {
+        if (enemy.focus && (!state.allies.includes(enemy.focus) || enemy.focus.hp <= 0)) {
+          enemy.focus = null;
+        }
+        if (enemy.focus) return enemy.focus;
+        const ally = findNearestAlly(enemy, Infinity);
+        const distToBase = distance(enemy, ctr);
+        if (ally) {
+          const distToAlly = distance(enemy, ally);
+          if (distToAlly <= distToBase) {
+            enemy.focus = ally;
+            return ally;
+          }
+        }
+        return 'base';
+      }
+
+      function findNearestEnemy(origin, rangePx) {
+        return findClosest(state.enemies, origin, rangePx);
+      }
+
+      function findEnemyFromBase(rangePx) {
+        return findClosest(state.enemies, ctr, rangePx);
+      }
+
+      function findNearestAlly(origin, rangePx) {
+        return findClosest(state.allies, origin, rangePx);
+      }
+
+      function findClosest(collection, origin, rangePx) {
+        let best = null;
+        let bestDist = Infinity;
+        collection.forEach((unit) => {
+          const dist = distance(origin, unit);
+          if (dist <= rangePx && dist < bestDist) {
+            best = unit;
+            bestDist = dist;
+          }
+        });
+        return best;
+      }
+
+      function moveTowards(obj, target, speed, delta) {
+        const dest = target === 'base' ? ctr : target;
+        const dx = dest.x - obj.x;
+        const dy = dest.y - obj.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist < 1) return;
+        const step = Math.min(dist, speed * (delta / 1000));
+        obj.x += (dx / dist) * step;
+        obj.y += (dy / dist) * step;
+      }
+
+      function fireProjectile(origin, target, damage, color, speed, ownerType, ownerRef = null) {
+        state.projectiles.push({ x: origin.x, y: origin.y, target, damage, color, speed, ownerType, ownerRef });
+        state.flashes.push({ x: origin.x, y: origin.y, color, created: performance.now() });
+      }
+
+      function updateProjectiles(delta) {
+        const isActiveTarget = (target) => {
+          if (target === 'base') return true;
+          return state.enemies.includes(target) || state.allies.includes(target);
+        };
+        for (let i = state.projectiles.length - 1; i >= 0; i -= 1) {
+          const proj = state.projectiles[i];
+          if (!proj.target || !isActiveTarget(proj.target)) {
+            state.projectiles.splice(i, 1);
+            continue;
+          }
+          const point = proj.target === 'base' ? ctr : proj.target;
+          const dx = point.x - proj.x;
+          const dy = point.y - proj.y;
+          const dist = Math.hypot(dx, dy);
+          const step = proj.speed * (delta / 1000);
+          if (dist <= step) {
+            applyDamage(proj.target, proj.damage, proj.ownerType, proj.ownerRef);
+            state.projectiles.splice(i, 1);
+          } else {
+            proj.x += (dx / dist) * step;
+            proj.y += (dy / dist) * step;
+          }
+        }
+      }
+
+      function applyDamage(target, damage, ownerType = null, ownerRef = null) {
+        if (target === 'base') {
+          state.baseHp -= damage;
+          return;
+        }
+        const enemyIdx = state.enemies.indexOf(target);
+        if (enemyIdx >= 0) {
+          const enemy = state.enemies[enemyIdx];
+          enemy.hp -= damage;
+          if (ownerType === 'ally' && ownerRef) enemy.focus = ownerRef;
+          if (enemy.hp <= 0) {
+            state.enemies.splice(enemyIdx, 1);
+            state.gold += CONFIG.economy.goldPerKill ?? 1;
+            state.kills += 1;
+          }
+          return;
+        }
+        const allyIdx = state.allies.indexOf(target);
+        if (allyIdx >= 0) {
+          state.allies[allyIdx].hp -= damage;
+          if (state.allies[allyIdx].hp <= 0) state.allies.splice(allyIdx, 1);
+        }
+      }
+
+      function distance(a, b) {
+        return Math.hypot(a.x - b.x, a.y - b.y);
+      }
+
+      function updateSpawns(delta) {
+        state.spawnTimers.melee += delta;
+        state.spawnTimers.ranger += delta;
+        if (state.spawnTimers.melee >= CONFIG.enemies.melee.spawn) {
+          spawnEnemy('melee');
+          state.spawnTimers.melee = 0;
+        }
+        if (state.spawnTimers.ranger >= CONFIG.enemies.ranger.spawn) {
+          spawnEnemy('ranger');
+          state.spawnTimers.ranger = 0;
+        }
+        if (state.elapsed >= state.nextBigWave) {
+          for (let i = 0; i < CONFIG.waves.bigWaveCount; i += 1) {
+            spawnEnemy('melee');
+            spawnEnemy('ranger');
+          }
+          state.nextBigWave += CONFIG.waves.bigWaveIntervalMs;
+        }
+      }
+
+      function updateHUD() {
+        UI.hp.textContent = Math.max(0, Math.ceil(state.baseHp));
+        UI.gold.textContent = state.gold;
+        UI.kills.textContent = state.kills;
+        const remain = Math.max(0, Math.ceil((CONFIG.runtime.durationMs - state.elapsed) / 1000));
+        UI.timer.textContent = `${remain}s`;
+        UI.buyBtn.disabled = !state.running || state.gameOver || state.gold < CONFIG.runtime.towerCost;
+        UI.buyBtn.textContent = `${CONFIG.runtime.towerCost} 골드로 새 타워 배치`;
+        UI.emergencyBtn.disabled =
+          !state.running || state.gameOver || state.gold < CONFIG.emergency.cost;
+        UI.emergencyBtn.textContent = `긴급 전력 (${CONFIG.emergency.cost}골드)`;
+      }
+
+      function gameLoop() {
+        const now = performance.now();
+        const delta = now - state.lastTime;
+        state.lastTime = now;
+        if (state.running && !state.gameOver) {
+          state.elapsed += delta;
+          updateSpawns(delta);
+          updatePowerOrb(delta);
+          updateTowers(delta);
+          updateAllies(delta);
+          updateEnemies(delta);
+          updateProjectiles(delta);
+          if (state.baseHp <= 0) {
+            state.baseHp = 0;
+            state.gameOver = true;
+            state.result = '기지가 파괴되었습니다...';
+          } else if (state.elapsed >= CONFIG.runtime.durationMs) {
+            state.gameOver = true;
+            state.result = '3분간 방어 성공! 승리!';
+          }
+          updateHUD();
+        }
+        draw();
+        requestAnimationFrame(gameLoop);
+      }
+
+      function draw() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        drawBase();
+        drawSlots();
+        drawPowerOrb();
+        drawEnemies();
+        drawAllies();
+        drawFlashes();
+        drawProjectiles();
+        drawDraggingTower();
+        if (state.gameOver) drawOverlay();
+      }
+
+      function drawBase() {
+        ctx.beginPath();
+        ctx.arc(ctr.x, ctr.y, CONFIG.base.radius, 0, Math.PI * 2);
+        ctx.fillStyle = '#1d2453';
+        ctx.fill();
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = '#94a3b8';
+        ctx.stroke();
+        const ratio = state.baseHp / CONFIG.base.maxHp;
+        ctx.beginPath();
+        ctx.arc(ctr.x, ctr.y, CONFIG.base.radius + 8, -Math.PI / 2, -Math.PI / 2 + ratio * Math.PI * 2);
+        ctx.strokeStyle = '#f87171';
+        ctx.lineWidth = 6;
+        ctx.stroke();
+      }
+
+      function towerLabel(tower) {
+        if (!tower) return '';
+        if (tower.type === 'offense') return 'ATK';
+        if (tower.type === 'summon') return 'SMN';
+        return 'HEAL';
+      }
+
+      function towerColor(tower) {
+        if (!tower) return 'rgba(148,163,184,0.2)';
+        if (tower.type === 'offense') return '#38bdf8';
+        if (tower.type === 'summon') return '#a78bfa';
+        return '#facc15';
+      }
+
+      function drawSlots() {
+        state.slots.forEach((slot, idx) => {
+          const pos = slotPosition(slot);
+          const highlight = state.dragging && canMerge(state.dragging.slot, slot);
+          ctx.save();
+          ctx.translate(pos.x, pos.y);
+          ctx.rotate(slot.angle + Math.PI / 2);
+          ctx.strokeStyle = highlight ? '#fde047' : 'rgba(148,163,184,0.4)';
+          ctx.lineWidth = highlight ? 3 : 1;
+          ctx.strokeRect(-22, -22, 44, 44);
+          ctx.lineWidth = 1;
+          ctx.fillStyle = 'rgba(148,163,184,0.2)';
+          ctx.font = '12px Pretendard';
+          ctx.textAlign = 'center';
+          ctx.fillText(String(idx + 1).padStart(2, '0'), 0, -26);
+          if (slot.tower) {
+            if (state.dragging && slot === state.dragging.slot) {
+              ctx.setLineDash([4, 3]);
+              ctx.strokeStyle = '#fde047';
+              ctx.strokeRect(-20, -20, 40, 40);
+              ctx.setLineDash([]);
+            } else {
+              ctx.fillStyle = towerColor(slot.tower);
+              ctx.fillRect(-20, -20, 40, 40);
+              ctx.fillStyle = '#020617';
+              ctx.font = '11px Pretendard';
+              ctx.fillText(`${towerLabel(slot.tower)} Lv${slot.tower.level}`, 0, 5);
+            }
+          }
+          ctx.restore();
+        });
+      }
+
+      function drawPowerOrb() {
+        const x = ctr.x + Math.cos(state.orbAngle) * CONFIG.orb.radius;
+        const y = ctr.y + Math.sin(state.orbAngle) * CONFIG.orb.radius;
+        ctx.beginPath();
+        ctx.arc(x, y, 12, 0, Math.PI * 2);
+        ctx.fillStyle = '#facc15';
+        ctx.shadowBlur = 18;
+        ctx.shadowColor = '#fde047';
+        ctx.fill();
+        ctx.shadowBlur = 0;
+      }
+
+      function drawEnemies() {
+        state.enemies.forEach((enemy) => {
+          const def = CONFIG.enemies[enemy.type];
+          ctx.fillStyle = enemy.type === 'melee' ? '#fb7185' : '#f472b6';
+          ctx.beginPath();
+          if (def.range <= 2) ctx.arc(enemy.x, enemy.y, 14, 0, Math.PI * 2);
+          else if (def.range >= 9) ctx.rect(enemy.x - 14, enemy.y - 14, 28, 28);
+          else {
+            ctx.moveTo(enemy.x, enemy.y - 14);
+            ctx.lineTo(enemy.x + 12, enemy.y + 14);
+            ctx.lineTo(enemy.x - 12, enemy.y + 14);
+            ctx.closePath();
+          }
+          ctx.fill();
+          const ratio = enemy.maxHp ? enemy.hp / enemy.maxHp : enemy.hp / def.hp;
+          ctx.fillStyle = '#0f172a';
+          ctx.fillRect(enemy.x - 16, enemy.y - 24, 32, 4);
+          ctx.fillStyle = '#f87171';
+          ctx.fillRect(enemy.x - 16, enemy.y - 24, 32 * Math.max(0, Math.min(1, ratio)), 4);
+        });
+      }
+
+      function drawAllies() {
+        state.allies.forEach((ally) => {
+          ctx.beginPath();
+          ctx.fillStyle = '#4ade80';
+          ctx.arc(ally.x, ally.y, 10, 0, Math.PI * 2);
+          ctx.fill();
+        });
+      }
+
+      function drawFlashes() {
+        const now = performance.now();
+        const lifetime = 160;
+        for (let i = state.flashes.length - 1; i >= 0; i -= 1) {
+          const flash = state.flashes[i];
+          const age = now - flash.created;
+          if (age > lifetime) {
+            state.flashes.splice(i, 1);
+            continue;
+          }
+          const alpha = 1 - age / lifetime;
+          const radius = 10 + (age / lifetime) * 12;
+          ctx.save();
+          ctx.globalAlpha = alpha;
+          ctx.strokeStyle = flash.color;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(flash.x, flash.y, radius, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+
+      function drawProjectiles() {
+        const r = CONFIG.projectiles.size;
+        state.projectiles.forEach((proj) => {
+          ctx.beginPath();
+          ctx.fillStyle = proj.color;
+          ctx.arc(proj.x, proj.y, r, 0, Math.PI * 2);
+          ctx.fill();
+        });
+      }
+
+      function drawDraggingTower() {
+        if (!state.dragging || !state.dragging.tower) return;
+        ctx.save();
+        ctx.translate(state.dragging.x, state.dragging.y);
+        ctx.globalAlpha = 0.9;
+        ctx.fillStyle = towerColor(state.dragging.tower);
+        ctx.fillRect(-20, -20, 40, 40);
+        ctx.fillStyle = '#020617';
+        ctx.font = '11px Pretendard';
+        ctx.textAlign = 'center';
+        ctx.fillText(`${towerLabel(state.dragging.tower)} Lv${state.dragging.tower.level}`, 0, 5);
+        ctx.restore();
+      }
+
+      function drawOverlay() {
+        ctx.fillStyle = 'rgba(2, 6, 23, 0.85)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#f8fafc';
+        ctx.font = 'bold 30px Pretendard';
+        ctx.textAlign = 'center';
+        ctx.fillText(state.result, ctr.x, ctr.y - 8);
+        ctx.font = '18px Pretendard';
+        ctx.fillText(`기록: ${Math.floor(state.elapsed / 1000)}초`, ctr.x, ctr.y + 20);
+      }
+
+      canvas.addEventListener('pointerdown', handlePointerDown);
+      window.addEventListener('pointermove', handlePointerMove);
+      window.addEventListener('pointerup', handlePointerUp);
+      window.addEventListener('pointercancel', handlePointerUp);
+
+      UI.buyBtn.addEventListener('click', () => {
+        if (!state.running || state.gameOver || state.gold < CONFIG.runtime.towerCost) return;
+        const emptySlots = state.slots.filter((slot) => !slot.tower);
+        if (!emptySlots.length) return;
+        state.gold -= CONFIG.runtime.towerCost;
+        const slot = randomOf(emptySlots);
+        const pool = Math.random() < 0.5 ? CONFIG.towers.offense : [...CONFIG.towers.summon, CONFIG.towers.heal];
+        slot.tower = createTower(randomOf(pool), slot);
+        registerTower(slot.tower);
+        updateHUD();
+      });
+
+      UI.emergencyBtn.addEventListener('click', () => {
+        if (!state.running || state.gameOver || state.gold < CONFIG.emergency.cost) return;
+        state.gold -= CONFIG.emergency.cost;
+        state.orbBoostLoops += CONFIG.emergency.loops;
+        updateHUD();
+      });
+
+      UI.startBtn.addEventListener('click', () => {
+        resetGame();
+        state.running = true;
+        UI.startBtn.textContent = '다시 시작';
+      });
+
+      async function boot() {
+        await loadExternalConfig();
+        resetGame();
+        state.running = true;
+        UI.startBtn.textContent = '다시 시작';
+        requestAnimationFrame(gameLoop);
+      }
+
+      boot();
+    </script>
