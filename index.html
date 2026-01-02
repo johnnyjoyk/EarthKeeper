@@ -138,6 +138,7 @@
         </div>
         <button id="buy-tower" class="btn secondary">골드로 새 타워 배치</button>
         <button id="emergency-power" class="btn secondary">긴급 전력 (7골드)</button>
+        <button id="cheat-gold" class="btn secondary">치트: 골드 +200</button>
         <div class="instructions">
           <p>
             노란 전력 구슬이 18개의 외곽 칸을 따라 5초에 한 바퀴 돌며 해당 칸의 능력을 활성화합니다.
@@ -255,12 +256,18 @@
         enemies: [],
         projectiles: [],
         flashes: [],
+        damagePopups: [],
         spawnTimers: { melee: 0, ranger: 0 },
         nextBigWave: CONFIG.waves.bigWaveIntervalMs,
         enemySpawnCount: 0,
         dragging: null,
         orbBoostLoops: 0,
         orbBoostProgress: 0,
+        orbFastSlotsRemaining: 0,
+        paused: false,
+        mergeChoice: null,
+        baseDamageReductionUntil: 0,
+        baseDamageReductionFactor: 1,
       };
 
       const UI = {
@@ -270,6 +277,7 @@
         kills: document.getElementById('kills'),
         buyBtn: document.getElementById('buy-tower'),
         emergencyBtn: document.getElementById('emergency-power'),
+        cheatBtn: document.getElementById('cheat-gold'),
         startBtn: document.getElementById('start-game'),
       };
 
@@ -287,12 +295,18 @@
         state.enemies = [];
         state.projectiles = [];
         state.flashes = [];
+        state.damagePopups = [];
         state.spawnTimers = { melee: 0, ranger: 0 };
         state.nextBigWave = CONFIG.waves.bigWaveIntervalMs;
         state.enemySpawnCount = 0;
         state.dragging = null;
         state.orbBoostLoops = 0;
         state.orbBoostProgress = 0;
+        state.orbFastSlotsRemaining = 0;
+        state.paused = false;
+        state.mergeChoice = null;
+        state.baseDamageReductionUntil = 0;
+        state.baseDamageReductionFactor = 1;
         placeInitialTowers();
         state.lastTime = performance.now();
         updateHUD();
@@ -333,12 +347,16 @@
       }
 
       function randomTowerDefAny() {
-        const pool = [
-          ...CONFIG.towers.offense,
-          ...CONFIG.towers.summon,
-          CONFIG.towers.heal,
-        ].filter(Boolean);
-        return randomOf(pool);
+        const pool = [...CONFIG.towers.offense, ...CONFIG.towers.summon];
+        if (CONFIG.towers.heal) pool.push(CONFIG.towers.heal);
+        return randomOf(pool.filter(Boolean));
+      }
+
+      function towerTypeFromDef(def) {
+        if (!def) return 'offense';
+        if (def.heal) return 'heal';
+        if (def.unit) return 'summon';
+        return 'offense';
       }
 
       function canMerge(sourceSlot, targetSlot) {
@@ -353,12 +371,26 @@
       }
 
       function attemptMerge(sourceSlot, targetSlot) {
-        if (!canMerge(sourceSlot, targetSlot)) return false;
-        const newDef = randomTowerDefAny();
+        if (!canMerge(sourceSlot, targetSlot) || state.mergeChoice) return false;
         const newLevel = Math.min(LEVEL_MAX, targetSlot.tower.level + 1);
+        const newDef = randomTowerDefAny();
         unregisterTower(sourceSlot.tower);
         unregisterTower(targetSlot.tower);
         sourceSlot.tower = null;
+        targetSlot.tower = null;
+        const resultType = towerTypeFromDef(newDef);
+        if (resultType === 'offense' && newLevel === 3) {
+          startOffenseChoice(targetSlot, newLevel, newDef);
+          return true;
+        }
+        if (resultType === 'heal' && newLevel === 3) {
+          startHealChoice(targetSlot, newLevel, newDef);
+          return true;
+        }
+        if (resultType === 'summon' && newLevel === 3) {
+          startSummonChoice(targetSlot, newLevel, newDef);
+          return true;
+        }
         const upgraded = createTower(newDef, targetSlot, newLevel);
         targetSlot.tower = upgraded;
         registerTower(upgraded);
@@ -384,6 +416,8 @@
             cooldown: 0,
             level,
             baseDef: def,
+            summonVariant: 'standard',
+            specialShape: null,
           };
         }
         return {
@@ -396,6 +430,7 @@
           lastAttack: 0,
           level,
           baseDef: def,
+          shotsThisActivation: 0,
         };
       }
 
@@ -436,6 +471,12 @@
         if (!state.running) return;
         if (typeof evt.button === 'number' && evt.button !== 0) return;
         const pos = canvasPoint(evt);
+        if (state.mergeChoice) {
+          evt.preventDefault();
+          handleMergeChoiceSelection(pos);
+          return;
+        }
+        if (state.paused) return;
         const slot = slotHitTest(pos.x, pos.y);
         if (!slot || !slot.tower) return;
         evt.preventDefault();
@@ -454,6 +495,7 @@
       }
 
       function handlePointerMove(evt) {
+        if (state.mergeChoice || state.paused) return;
         if (!state.dragging || state.dragging.pointerId !== evt.pointerId) return;
         const pos = canvasPoint(evt);
         state.dragging.x = pos.x;
@@ -479,6 +521,7 @@
         if (tower.type === 'offense') {
           tower.activeUntil = performance.now() + CONFIG.orb.activeMs;
           tower.lastAttack = 0;
+          tower.shotsThisActivation = 0;
         } else if (tower.type === 'summon') {
           if (tower.cooldown < performance.now()) {
             spawnAlly(tower);
@@ -486,6 +529,13 @@
           }
         } else if (tower.type === 'heal') {
           state.baseHp = Math.min(CONFIG.base.maxHp, state.baseHp + getHealAmount(tower));
+          if (tower.healVariant === 'speed-chain') {
+            state.orbFastSlotsRemaining += 6;
+          } else if (tower.healVariant === 'shield') {
+            state.baseHp = Math.min(CONFIG.base.maxHp, state.baseHp + 50);
+            state.baseDamageReductionUntil = performance.now() + 2000;
+            state.baseDamageReductionFactor = 0.4;
+          }
         }
       }
 
@@ -493,21 +543,48 @@
         const unit = tower.unit;
         const pos = slotPosition(tower.slot);
         const stats = getSummonStats(tower);
+        const variant = tower.summonVariant || 'standard';
+        const baseSpeed = CONFIG.enemies.melee.speed;
         for (let i = 0; i < stats.count; i += 1) {
           const spread = stats.count > 1 ? 18 : 0;
           const angleOffset = stats.count > 1 ? (i - (stats.count - 1) / 2) * 0.35 : 0;
           const offsetX = spread ? Math.cos(tower.slot.angle + angleOffset) * spread : 0;
           const offsetY = spread ? Math.sin(tower.slot.angle + angleOffset) * spread : 0;
+          let hp = unit.hp;
+          let damage = unit.dmg;
+          let speed = baseSpeed;
+          let shape = 'circle';
+          let color = '#4ade80';
+          let tauntRadius = 0;
+          let fanCone = null;
+          if (variant === 'tank') {
+            hp *= 2;
+            damage *= 0.5;
+            shape = 'rectangle';
+            color = '#fb923c';
+            tauntRadius = 300;
+          } else if (variant === 'fan') {
+            damage *= 0.5;
+            speed = baseSpeed / 3;
+            shape = 'fan';
+            color = '#60a5fa';
+            fanCone = { radius: 75, angle: 120 };
+          }
           state.allies.push({
             x: pos.x + offsetX,
             y: pos.y + offsetY,
-            hp: unit.hp,
-            damage: unit.dmg,
+            hp,
+            damage,
             aps: stats.aps,
             rangePx: unit.range * CONFIG.grid.tile,
-            speed: CONFIG.enemies.melee.speed,
+            speed,
             lastAttack: 0,
             expireAt: performance.now() + 10000,
+            variant,
+            shape,
+            color,
+            tauntRadius,
+            fanCone,
           });
         }
       }
@@ -517,23 +594,217 @@
         return Math.pow(LEVEL_SPEED_MULT, level - 1);
       }
 
+      function effectiveLevel(tower) {
+        if (!tower) return 1;
+        return tower.level + getAuraBonus(tower);
+      }
+
+      function getAuraBonus(tower) {
+        if (!tower || !tower.slot) return 0;
+        let bonus = 0;
+        state.towers.forEach((other) => {
+          if (!other || other === tower || other.variant !== 'mentor' || !other.slot) return;
+          const dist = distance(slotPosition(other.slot), slotPosition(tower.slot));
+          if (dist <= 70) bonus += 1;
+        });
+        return bonus;
+      }
+
       function getOffenseStats(tower) {
+        const level = effectiveLevel(tower);
         return {
           rangePx: tower.rangePx,
-          aps: tower.aps * levelMultiplier(tower.level),
+          aps: tower.aps * levelMultiplier(level),
           damage: tower.damage,
         };
       }
 
       function getHealAmount(tower) {
-        return (tower.heal || CONFIG.grid.healAmount) * levelMultiplier(tower.level);
+        const level = effectiveLevel(tower);
+        return (tower.heal || CONFIG.grid.healAmount) * levelMultiplier(level);
       }
 
       function getSummonStats(tower) {
+        const level = effectiveLevel(tower);
         return {
-          count: tower.level > 1 ? 2 : 1,
-          aps: tower.unit.aps * levelMultiplier(tower.level),
+          count: level > 1 ? 2 : 1,
+          aps: tower.unit.aps * levelMultiplier(level),
         };
+      }
+
+      function startOffenseChoice(slot, level, baseDef) {
+        const cards = buildOffenseChoiceCards(baseDef);
+        state.mergeChoice = {
+          slot,
+          level,
+          baseDef,
+          cards,
+          cardBounds: [],
+          type: 'offense',
+        };
+        state.paused = true;
+      }
+
+      function startHealChoice(slot, level, baseDef) {
+        const cards = buildHealChoiceCards();
+        state.mergeChoice = {
+          slot,
+          level,
+          baseDef,
+          cards,
+          cardBounds: [],
+          type: 'heal',
+        };
+        state.paused = true;
+      }
+
+      function buildOffenseChoiceCards(baseDef) {
+        const baseDamage = baseDef?.dmg || 6;
+        return [
+          {
+            key: 'knockback',
+            title: '넉백 타워',
+            desc: `공격력 70% (${Math.round(baseDamage * 0.7)}) 데미지\n명중 시 적을 크게 밀쳐냅니다.`,
+            damageMultiplier: 0.7,
+            variant: 'knockback',
+            shape: 'hex',
+          },
+          {
+            key: 'explosive',
+            title: '폭발형 타워',
+            desc: `공격력 60% (${Math.round(baseDamage * 0.6)}) 데미지\n100px 범위 폭발로 광역 피해.`,
+            damageMultiplier: 0.6,
+            variant: 'explosive',
+            shape: 'triangle',
+            radius: 100,
+          },
+          {
+            key: 'standard',
+            title: '일반 공격형',
+            desc: `공격력 120% (${Math.round(baseDamage * 1.2)}) 데미지\n집중 사격으로 높은 피해.`,
+            damageMultiplier: 1.2,
+            variant: 'standard',
+            shape: 'circle',
+          },
+        ];
+      }
+
+      function finalizeOffenseChoice(option) {
+        if (!state.mergeChoice) return;
+        const slot = state.mergeChoice.slot;
+        const level = state.mergeChoice.level;
+        const baseDef = state.mergeChoice.baseDef || randomTowerDefByType('offense');
+        const tower = createTower(baseDef, slot, level);
+        slot.tower = tower;
+        const baseDamage = baseDef?.dmg ?? tower.damage;
+        tower.damage = baseDamage * option.damageMultiplier;
+        tower.specialShape = option.shape;
+        tower.variant = option.variant;
+        if (option.variant === 'explosive') {
+          tower.explosionRadius = option.radius || 100;
+        } else if (option.variant === 'knockback') {
+          tower.knockback = true;
+        }
+        registerTower(tower);
+        state.mergeChoice = null;
+        state.paused = false;
+      }
+
+      function buildHealChoiceCards() {
+        return [
+          {
+            key: 'speed-chain',
+            title: '전력 가속',
+            desc: '발동 후 다음 6칸 동안\n전력 구슬 속도 2배',
+            variant: 'speed-chain',
+            shape: 'diamond',
+          },
+          {
+            key: 'sanctuary',
+            title: '보호 장막',
+            desc: '즉시 HP 50 회복 후\n2초간 본체 피해 60% 감소',
+            variant: 'shield',
+            shape: 'circle',
+          },
+          {
+            key: 'mentor',
+            title: '격려의 제단',
+            desc: '근접한 타워들의 실질 레벨 +1\n(합성 레벨에는 미반영)',
+            variant: 'mentor',
+            shape: 'triangle',
+          },
+        ];
+      }
+
+      function finalizeHealChoice(option) {
+        if (!state.mergeChoice) return;
+        const slot = state.mergeChoice.slot;
+        const level = state.mergeChoice.level;
+        const baseDef = state.mergeChoice.baseDef || CONFIG.towers.heal;
+        const tower = createTower(baseDef, slot, level);
+        slot.tower = tower;
+        tower.healVariant = option.variant;
+        if (option.shape) tower.specialShape = option.shape;
+        if (option.variant === 'mentor') {
+          tower.variant = 'mentor';
+        }
+        registerTower(tower);
+        state.mergeChoice = null;
+        state.paused = false;
+      }
+
+      function startSummonChoice(slot, level, baseDef) {
+        const cards = buildSummonChoiceCards(baseDef);
+        state.mergeChoice = {
+          slot,
+          level,
+          baseDef,
+          cards,
+          cardBounds: [],
+          type: 'summon',
+        };
+        state.paused = true;
+      }
+
+      function buildSummonChoiceCards(baseDef) {
+        const unit = baseDef?.unit || { hp: 40, dmg: 4 };
+        return [
+          {
+            key: 'standard',
+            title: '일반 소환',
+            desc: '기존 능력치의 공격 유닛을 소환합니다.',
+            variant: 'standard',
+            shape: 'circle',
+          },
+          {
+            key: 'tank',
+            title: '방패병',
+            desc: '긴 막대기형 유닛.\nHP x2, ATK 50%, 300px 도발.',
+            variant: 'tank',
+            shape: 'rectangle',
+          },
+          {
+            key: 'fan',
+            title: '서리 부채',
+            desc: '부채꼴 광역 공격.\n이동속도 1/3, ATK 50%.',
+            variant: 'fan',
+            shape: 'fan',
+          },
+        ];
+      }
+
+      function finalizeSummonChoice(option) {
+        if (!state.mergeChoice) return;
+        const slot = state.mergeChoice.slot;
+        const level = state.mergeChoice.level;
+        const baseDef = state.mergeChoice.baseDef;
+        const tower = createTower(baseDef, slot, level);
+        slot.tower = tower;
+        tower.summonVariant = option.variant;
+        tower.specialShape = option.shape;
+        registerTower(tower);
+        state.mergeChoice = null;
+        state.paused = false;
       }
 
       function spawnEnemy(type) {
@@ -557,11 +828,18 @@
           aps: def.aps,
           lastAttack: 0,
           focus: null,
+          knockbackLockUntil: 0,
         });
       }
 
       function updatePowerOrb(delta) {
-        const rev = state.orbBoostLoops > 0 ? CONFIG.emergency.revolutionMs : CONFIG.orb.revolutionMs;
+        const fastBoost = state.orbFastSlotsRemaining > 0 && state.orbBoostLoops <= 0;
+        const rev =
+          state.orbBoostLoops > 0
+            ? CONFIG.emergency.revolutionMs
+            : fastBoost
+            ? CONFIG.orb.revolutionMs / 2
+            : CONFIG.orb.revolutionMs;
         const deltaAngle = ((Math.PI * 2) / rev) * delta;
         state.orbAngle = (state.orbAngle + deltaAngle) % (Math.PI * 2);
         if (state.orbBoostLoops > 0) {
@@ -583,6 +861,9 @@
           if (Math.abs(diff) < 0.12 && performance.now() - slot.lastActivated > 450) {
             activateSlot(slot);
             slot.lastActivated = performance.now();
+            if (state.orbFastSlotsRemaining > 0) {
+              state.orbFastSlotsRemaining = Math.max(0, state.orbFastSlotsRemaining - 1);
+            }
           }
         });
       }
@@ -601,11 +882,27 @@
           if (now > tower.activeUntil) return;
           const origin = slotPosition(tower.slot);
           const stats = getOffenseStats(tower);
+          const limitShot = tower.variant === 'explosive';
+          if (limitShot && tower.shotsThisActivation >= 1) return;
           if (now - tower.lastAttack >= 1000 / stats.aps) {
             const target = findEnemyFromBase(stats.rangePx);
             if (target) {
-              fireProjectile(origin, target, stats.damage, '#38bdf8', CONFIG.projectiles.tower, 'tower');
+              const meta =
+                tower.variant === 'explosive'
+                  ? { type: 'explosive', radius: tower.explosionRadius || 100 }
+                  : null;
+              fireProjectile(
+                origin,
+                target,
+                stats.damage,
+                '#38bdf8',
+                CONFIG.projectiles.tower,
+                'tower',
+                tower,
+                meta
+              );
               tower.lastAttack = now;
+              tower.shotsThisActivation = (tower.shotsThisActivation || 0) + 1;
             }
           }
         });
@@ -624,19 +921,41 @@
           if (now - ally.lastAttack >= 1000 / ally.aps) {
             const target = findNearestEnemy(ally, ally.rangePx);
             if (target) {
-              fireProjectile(
-                { x: ally.x, y: ally.y },
-                target,
-                ally.damage,
-                '#4ade80',
-                CONFIG.projectiles.ally,
-                'ally',
-                ally
-              );
+              if (ally.variant === 'fan' && ally.fanCone) {
+                fanAttack(ally, target);
+              } else {
+                fireProjectile(
+                  { x: ally.x, y: ally.y },
+                  target,
+                  ally.damage,
+                  ally.color || '#4ade80',
+                  CONFIG.projectiles.ally,
+                  'ally',
+                  ally
+                );
+              }
               ally.lastAttack = now;
             }
           }
         }
+      }
+
+      function handleMergeChoiceSelection(pos) {
+        if (!state.mergeChoice || !state.mergeChoice.cardBounds) return false;
+        for (const card of state.mergeChoice.cardBounds) {
+          if (
+            pos.x >= card.x &&
+            pos.x <= card.x + card.width &&
+            pos.y >= card.y &&
+            pos.y <= card.y + card.height
+          ) {
+            if (state.mergeChoice.type === 'heal') finalizeHealChoice(card.option);
+            else if (state.mergeChoice.type === 'summon') finalizeSummonChoice(card.option);
+            else finalizeOffenseChoice(card.option);
+            return true;
+          }
+        }
+        return false;
       }
 
       function updateEnemies(delta) {
@@ -654,7 +973,8 @@
                 enemy.attack,
                 '#fb7185',
                 CONFIG.projectiles.enemy,
-                'enemy'
+                'enemy',
+                enemy
               );
             }
             enemy.lastAttack = now;
@@ -665,6 +985,11 @@
       function chooseEnemyTarget(enemy) {
         if (enemy.focus && (!state.allies.includes(enemy.focus) || enemy.focus.hp <= 0)) {
           enemy.focus = null;
+        }
+        const taunt = findTauntTarget(enemy);
+        if (taunt) {
+          enemy.focus = taunt;
+          return taunt;
         }
         if (enemy.focus) return enemy.focus;
         const ally = findNearestAlly(enemy, Infinity);
@@ -691,6 +1016,13 @@
         return findClosest(state.allies, origin, rangePx);
       }
 
+      function findTauntTarget(enemy) {
+        for (const ally of state.allies) {
+          if (ally.tauntRadius && distance(ally, enemy) <= ally.tauntRadius) return ally;
+        }
+        return null;
+      }
+
       function findClosest(collection, origin, rangePx) {
         let best = null;
         let bestDist = Infinity;
@@ -715,9 +1047,48 @@
         obj.y += (dy / dist) * step;
       }
 
-      function fireProjectile(origin, target, damage, color, speed, ownerType, ownerRef = null) {
-        state.projectiles.push({ x: origin.x, y: origin.y, target, damage, color, speed, ownerType, ownerRef });
+      function fireProjectile(origin, target, damage, color, speed, ownerType, ownerRef = null, meta = null) {
+        state.projectiles.push({
+          x: origin.x,
+          y: origin.y,
+          target,
+          damage,
+          color,
+          speed,
+          ownerType,
+          ownerRef,
+          meta,
+        });
         state.flashes.push({ x: origin.x, y: origin.y, color, created: performance.now() });
+      }
+
+      function showAoeRing(x, y, radius, color = '#f87171', duration = 220) {
+        state.flashes.push({ x, y, color, radius, duration, created: performance.now() });
+      }
+
+      function showConeFlash(x, y, radius, angle, spread, color = 'rgba(59,130,246,0.5)', duration = 200) {
+        state.flashes.push({
+          type: 'cone',
+          x,
+          y,
+          radius,
+          angle,
+          spread,
+          color,
+          duration,
+          created: performance.now(),
+        });
+      }
+
+      function addDamagePopup(x, y, amount, color) {
+        state.damagePopups.push({
+          x,
+          y,
+          amount,
+          color,
+          created: performance.now(),
+          duration: 150,
+        });
       }
 
       function updateProjectiles(delta) {
@@ -737,7 +1108,7 @@
           const dist = Math.hypot(dx, dy);
           const step = proj.speed * (delta / 1000);
           if (dist <= step) {
-            applyDamage(proj.target, proj.damage, proj.ownerType, proj.ownerRef);
+            applyDamage(proj.target, proj.damage, proj.ownerType, proj.ownerRef, proj.meta, point);
             state.projectiles.splice(i, 1);
           } else {
             proj.x += (dx / dist) * step;
@@ -746,28 +1117,86 @@
         }
       }
 
-      function applyDamage(target, damage, ownerType = null, ownerRef = null) {
+      function applyDamage(target, damage, ownerType = null, ownerRef = null, meta = null, point = null) {
+        if (ownerType === 'tower' && ownerRef?.variant === 'explosive' && meta?.type === 'explosive' && point) {
+          showAoeRing(point.x, point.y, meta.radius);
+          for (let i = state.enemies.length - 1; i >= 0; i -= 1) {
+            const enemy = state.enemies[i];
+            if (distance(enemy, point) <= meta.radius) {
+              damageEnemy(enemy, damage, ownerType, ownerRef);
+            }
+          }
+          return;
+        }
         if (target === 'base') {
-          state.baseHp -= damage;
+          const now = performance.now();
+          if (now > state.baseDamageReductionUntil) {
+            state.baseDamageReductionFactor = 1;
+          }
+          const factor = now < state.baseDamageReductionUntil ? state.baseDamageReductionFactor : 1;
+          const actual = damage * factor;
+          state.baseHp -= actual;
+          addDamagePopup(ctr.x, ctr.y - CONFIG.base.radius, actual, '#f87171');
           return;
         }
         const enemyIdx = state.enemies.indexOf(target);
         if (enemyIdx >= 0) {
           const enemy = state.enemies[enemyIdx];
-          enemy.hp -= damage;
-          if (ownerType === 'ally' && ownerRef) enemy.focus = ownerRef;
-          if (enemy.hp <= 0) {
-            state.enemies.splice(enemyIdx, 1);
-            state.gold += CONFIG.economy.goldPerKill ?? 1;
-            state.kills += 1;
+          damageEnemy(enemy, damage, ownerType, ownerRef);
+          if (ownerType === 'tower' && ownerRef?.variant === 'knockback' && enemy.hp > 0) {
+            applyKnockback(enemy);
           }
           return;
         }
         const allyIdx = state.allies.indexOf(target);
         if (allyIdx >= 0) {
           state.allies[allyIdx].hp -= damage;
+          addDamagePopup(state.allies[allyIdx].x, state.allies[allyIdx].y - 12, damage, '#f87171');
           if (state.allies[allyIdx].hp <= 0) state.allies.splice(allyIdx, 1);
         }
+      }
+
+      function damageEnemy(enemy, damage, ownerType, ownerRef) {
+        if (!enemy) return;
+        enemy.hp -= damage;
+        addDamagePopup(enemy.x, enemy.y - 16, damage, '#f8fafc');
+        if (ownerType === 'ally' && ownerRef) enemy.focus = ownerRef;
+        if (enemy.hp <= 0) {
+          const idx = state.enemies.indexOf(enemy);
+          if (idx >= 0) state.enemies.splice(idx, 1);
+          state.gold += CONFIG.economy.goldPerKill ?? 1;
+          state.kills += 1;
+        }
+      }
+
+      function applyKnockback(enemy) {
+        const now = performance.now();
+        if (enemy.knockbackLockUntil && now < enemy.knockbackLockUntil) return;
+        const dx = enemy.x - ctr.x;
+        const dy = enemy.y - ctr.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist === 0) return;
+        const push = 28;
+        enemy.x += (dx / dist) * push;
+        enemy.y += (dy / dist) * push;
+        enemy.knockbackLockUntil = now + 1000;
+      }
+
+      function fanAttack(ally, target) {
+        const cone = ally.fanCone;
+        if (!cone) return;
+        const dir = Math.atan2(target.y - ally.y, target.x - ally.x);
+        const half = ((cone.angle || 120) * Math.PI) / 360;
+        showConeFlash(ally.x, ally.y, cone.radius || 75, dir, cone.angle || 120, 'rgba(59,130,246,0.45)');
+        state.enemies.forEach((enemy) => {
+          const dist = distance(ally, enemy);
+          if (dist > (cone.radius || 75)) return;
+          const ang = Math.atan2(enemy.y - ally.y, enemy.x - ally.x);
+          const diff = Math.abs(normalizeAngle(dir - ang));
+          if (diff <= half) {
+            damageEnemy(enemy, ally.damage, 'ally', ally);
+          }
+        });
       }
 
       function distance(a, b) {
@@ -800,18 +1229,20 @@
         UI.kills.textContent = state.kills;
         const remain = Math.max(0, Math.ceil((CONFIG.runtime.durationMs - state.elapsed) / 1000));
         UI.timer.textContent = `${remain}s`;
-        UI.buyBtn.disabled = !state.running || state.gameOver || state.gold < CONFIG.runtime.towerCost;
-        UI.buyBtn.textContent = `${CONFIG.runtime.towerCost} 골드로 새 타워 배치`;
-        UI.emergencyBtn.disabled =
-          !state.running || state.gameOver || state.gold < CONFIG.emergency.cost;
-        UI.emergencyBtn.textContent = `긴급 전력 (${CONFIG.emergency.cost}골드)`;
-      }
+       UI.buyBtn.disabled =
+         !state.running || state.gameOver || state.gold < CONFIG.runtime.towerCost || state.paused;
+       UI.buyBtn.textContent = `${CONFIG.runtime.towerCost} 골드로 새 타워 배치`;
+       UI.emergencyBtn.disabled =
+         !state.running || state.gameOver || state.gold < CONFIG.emergency.cost || state.paused;
+       UI.emergencyBtn.textContent = `긴급 전력 (${CONFIG.emergency.cost}골드)`;
+       UI.cheatBtn.disabled = !state.running || state.gameOver;
+     }
 
       function gameLoop() {
         const now = performance.now();
         const delta = now - state.lastTime;
         state.lastTime = now;
-        if (state.running && !state.gameOver) {
+        if (state.running && !state.gameOver && !state.paused) {
           state.elapsed += delta;
           updateSpawns(delta);
           updatePowerOrb(delta);
@@ -827,8 +1258,8 @@
             state.gameOver = true;
             state.result = '3분간 방어 성공! 승리!';
           }
-          updateHUD();
         }
+        updateHUD();
         draw();
         requestAnimationFrame(gameLoop);
       }
@@ -842,7 +1273,9 @@
         drawAllies();
         drawFlashes();
         drawProjectiles();
+        drawDamagePopups();
         drawDraggingTower();
+        if (state.mergeChoice) drawMergeChoiceOverlay();
         if (state.gameOver) drawOverlay();
       }
 
@@ -876,6 +1309,16 @@
         return '#facc15';
       }
 
+      function drawTowerLabels(tower) {
+        if (!tower) return;
+        ctx.fillStyle = '#020617';
+        ctx.font = '11px Pretendard';
+        ctx.textAlign = 'center';
+        ctx.fillText(towerLabel(tower), 0, -2);
+        ctx.font = '13px Pretendard';
+        ctx.fillText(`Lv${tower.level}`, 0, 18);
+      }
+
       function drawSlots() {
         state.slots.forEach((slot, idx) => {
           const pos = slotPosition(slot);
@@ -900,13 +1343,72 @@
             } else {
               ctx.fillStyle = towerColor(slot.tower);
               ctx.fillRect(-20, -20, 40, 40);
-              ctx.fillStyle = '#020617';
-              ctx.font = '11px Pretendard';
-              ctx.fillText(`${towerLabel(slot.tower)} Lv${slot.tower.level}`, 0, 5);
+              drawTowerVariantOverlay(slot.tower);
+              drawTowerLabels(slot.tower);
             }
           }
           ctx.restore();
         });
+      }
+
+      function drawTowerVariantOverlay(tower) {
+        ctx.save();
+        if (tower.specialShape) {
+          ctx.globalAlpha = 0.5;
+          ctx.fillStyle = '#000000';
+          drawShapePath(tower.specialShape, 16);
+          ctx.fill();
+          ctx.globalAlpha = 1;
+        }
+        if (tower.variant === 'mentor') {
+          ctx.fillStyle = 'rgba(250,204,21,0.3)';
+          ctx.fillRect(-20, -20, 40, 40);
+          ctx.strokeStyle = 'rgba(250,204,21,0.65)';
+          ctx.lineWidth = 2;
+          ctx.strokeRect(-22, -22, 44, 44);
+          ctx.lineWidth = 1;
+        }
+        if (getAuraBonus(tower) > 0) {
+          ctx.fillStyle = 'rgba(250,204,21,0.25)';
+          ctx.fillRect(-20, -20, 40, 40);
+        }
+        ctx.restore();
+      }
+
+      function drawShapePath(shape, radius = 16) {
+        ctx.beginPath();
+        if (shape === 'hex') {
+          for (let i = 0; i < 6; i += 1) {
+            const angle = (Math.PI / 3) * i - Math.PI / 2;
+            const x = Math.cos(angle) * radius;
+            const y = Math.sin(angle) * radius;
+            if (i === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+          }
+          ctx.closePath();
+        } else if (shape === 'triangle') {
+          ctx.moveTo(0, -radius);
+          ctx.lineTo(radius * 0.9, radius * 0.9);
+          ctx.lineTo(-radius * 0.9, radius * 0.9);
+          ctx.closePath();
+        } else if (shape === 'diamond') {
+          ctx.moveTo(0, -radius);
+          ctx.lineTo(radius, 0);
+          ctx.lineTo(0, radius);
+          ctx.lineTo(-radius, 0);
+          ctx.closePath();
+        } else if (shape === 'square') {
+          ctx.rect(-radius, -radius, radius * 2, radius * 2);
+        } else if (shape === 'rectangle') {
+          ctx.rect(-radius * 1.8, -radius * 0.6, radius * 3.6, radius * 1.2);
+        } else if (shape === 'fan') {
+          const fanAngle = (120 * Math.PI) / 180;
+          ctx.moveTo(0, 0);
+          ctx.arc(0, 0, radius, -fanAngle / 2, fanAngle / 2);
+          ctx.closePath();
+        } else {
+          ctx.arc(0, 0, radius, 0, Math.PI * 2);
+        }
       }
 
       function drawPowerOrb() {
@@ -945,32 +1447,47 @@
 
       function drawAllies() {
         state.allies.forEach((ally) => {
-          ctx.beginPath();
-          ctx.fillStyle = '#4ade80';
-          ctx.arc(ally.x, ally.y, 10, 0, Math.PI * 2);
+          ctx.save();
+          ctx.translate(ally.x, ally.y);
+          ctx.fillStyle = ally.color || '#4ade80';
+          drawShapePath(ally.shape || 'circle', ally.shape === 'rectangle' ? 8 : 10);
           ctx.fill();
+          ctx.restore();
         });
       }
 
       function drawFlashes() {
         const now = performance.now();
-        const lifetime = 160;
         for (let i = state.flashes.length - 1; i >= 0; i -= 1) {
           const flash = state.flashes[i];
+          const lifetime = flash.duration || 160;
           const age = now - flash.created;
           if (age > lifetime) {
             state.flashes.splice(i, 1);
             continue;
           }
-          const alpha = 1 - age / lifetime;
-          const radius = 10 + (age / lifetime) * 12;
           ctx.save();
-          ctx.globalAlpha = alpha;
-          ctx.strokeStyle = flash.color;
-          ctx.lineWidth = 2;
-          ctx.beginPath();
-          ctx.arc(flash.x, flash.y, radius, 0, Math.PI * 2);
-          ctx.stroke();
+          ctx.globalAlpha = Math.max(0, 1 - age / lifetime);
+          if (flash.type === 'cone') {
+            const radius = flash.radius || 60;
+            const spread = ((flash.spread || 120) * Math.PI) / 180;
+            const half = spread / 2;
+            ctx.translate(flash.x, flash.y);
+            ctx.rotate(flash.angle || 0);
+            ctx.beginPath();
+            ctx.moveTo(0, 0);
+            ctx.arc(0, 0, radius, -half, half);
+            ctx.closePath();
+            ctx.fillStyle = flash.color || 'rgba(59,130,246,0.5)';
+            ctx.fill();
+          } else {
+            ctx.strokeStyle = flash.color;
+            ctx.lineWidth = flash.radius ? 3 : 2;
+            ctx.beginPath();
+            const radius = flash.radius ? flash.radius : 10 + (age / lifetime) * 12;
+            ctx.arc(flash.x, flash.y, radius, 0, Math.PI * 2);
+            ctx.stroke();
+          }
           ctx.restore();
         }
       }
@@ -985,6 +1502,26 @@
         });
       }
 
+      function drawDamagePopups() {
+        const now = performance.now();
+        for (let i = state.damagePopups.length - 1; i >= 0; i -= 1) {
+          const pop = state.damagePopups[i];
+          const age = now - pop.created;
+          if (age > pop.duration) {
+            state.damagePopups.splice(i, 1);
+            continue;
+          }
+          const progress = age / pop.duration;
+          ctx.save();
+          ctx.globalAlpha = 1 - progress;
+          ctx.fillStyle = pop.color;
+          ctx.font = 'bold 14px Pretendard';
+          ctx.textAlign = 'center';
+          ctx.fillText(Math.round(pop.amount), pop.x, pop.y - progress * 20);
+          ctx.restore();
+        }
+      }
+
       function drawDraggingTower() {
         if (!state.dragging || !state.dragging.tower) return;
         ctx.save();
@@ -992,10 +1529,65 @@
         ctx.globalAlpha = 0.9;
         ctx.fillStyle = towerColor(state.dragging.tower);
         ctx.fillRect(-20, -20, 40, 40);
-        ctx.fillStyle = '#020617';
-        ctx.font = '11px Pretendard';
+        drawTowerVariantOverlay(state.dragging.tower);
+        drawTowerLabels(state.dragging.tower);
+        ctx.restore();
+      }
+
+      function drawMergeChoiceOverlay() {
+        if (!state.mergeChoice) return;
+        const choice = state.mergeChoice;
+        ctx.save();
+        ctx.fillStyle = 'rgba(2, 6, 23, 0.86)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#f8fafc';
+        ctx.font = 'bold 24px Pretendard';
         ctx.textAlign = 'center';
-        ctx.fillText(`${towerLabel(state.dragging.tower)} Lv${state.dragging.tower.level}`, 0, 5);
+        const title =
+          choice.type === 'heal' ? '3레벨 회복 타워를 선택하세요' : '3레벨 공격 타워를 선택하세요';
+        ctx.fillText(title, ctr.x, ctr.y - 150);
+        ctx.font = '15px Pretendard';
+        ctx.fillText('카드를 클릭하면 게임이 다시 진행됩니다.', ctr.x, ctr.y - 120);
+        const cardWidth = 220;
+        const cardHeight = 220;
+        const spacing = 30;
+        const totalWidth = cardWidth * choice.cards.length + spacing * (choice.cards.length - 1);
+        let startX = ctr.x - totalWidth / 2;
+        const startY = ctr.y - cardHeight / 2;
+        choice.cardBounds = [];
+        choice.cards.forEach((card, idx) => {
+          const x = startX + idx * (cardWidth + spacing);
+          const y = startY;
+          ctx.fillStyle = 'rgba(15,23,42,0.95)';
+          ctx.strokeStyle = '#38bdf8';
+          ctx.lineWidth = 2;
+          ctx.fillRect(x, y, cardWidth, cardHeight);
+          ctx.strokeRect(x, y, cardWidth, cardHeight);
+          ctx.fillStyle = '#f8fafc';
+          ctx.font = '18px Pretendard';
+          ctx.textAlign = 'center';
+          ctx.fillText(card.title, x + cardWidth / 2, y + 30);
+          const shapeColor = choice.type === 'heal' ? '#facc15' : '#38bdf8';
+          drawChoiceShape(card.shape, x + cardWidth / 2, y + 95, shapeColor);
+          ctx.fillStyle = '#cbd5f5';
+          ctx.font = '13px Pretendard';
+          ctx.textAlign = 'left';
+          const lines = card.desc.split('\n');
+          lines.forEach((line, lineIdx) => {
+            ctx.fillText(line, x + 16, y + 140 + lineIdx * 18);
+          });
+          choice.cardBounds.push({ x, y, width: cardWidth, height: cardHeight, option: card });
+        });
+        ctx.restore();
+      }
+
+      function drawChoiceShape(shape, cx, cy, color = '#38bdf8') {
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.beginPath();
+        drawShapePath(shape, 32);
+        ctx.fillStyle = color;
+        ctx.fill();
         ctx.restore();
       }
 
@@ -1027,10 +1619,16 @@
         updateHUD();
       });
 
-      UI.emergencyBtn.addEventListener('click', () => {
-        if (!state.running || state.gameOver || state.gold < CONFIG.emergency.cost) return;
-        state.gold -= CONFIG.emergency.cost;
-        state.orbBoostLoops += CONFIG.emergency.loops;
+     UI.emergencyBtn.addEventListener('click', () => {
+       if (!state.running || state.gameOver || state.gold < CONFIG.emergency.cost) return;
+       state.gold -= CONFIG.emergency.cost;
+       state.orbBoostLoops += CONFIG.emergency.loops;
+       updateHUD();
+     });
+
+     UI.cheatBtn.addEventListener('click', () => {
+        if (!state.running || state.gameOver) return;
+        state.gold += 200;
         updateHUD();
       });
 
